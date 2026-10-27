@@ -930,3 +930,108 @@ test("다음 OCR 페이지의 다른 종류는 대상 보유주식에 합산하�
   assert.equal(result.owned, 1_940);
   assert.equal(result.total, 1_556_321);
 });
+
+test("주소와 지분율 사이로 분리된 같은 주주의 종류와 수량을 연결한다", () => {
+  const result = parseRegisterLines([
+    "한빛웨이브 1 호",
+    "서울특별시 가상구 예시대로 75길 25, 상환전환우선주식",
+    "5 1 코노미투자조합 2019. 10. 12. 7.21%",
+    "4 층 , 5 층 ( 예시동 ) 2,762 주",
+    "다음투자조합",
+    "상환전환우선주식 1,380주 3.60%",
+    "보통주식 15,365주 / 자기주식 7,040주 / 전환상환우선주식 3,478주 /",
+    "상환전환우선주식 8,284주 / 에이3의1종상환전환우선주식 2,182주 /",
+    "합계",
+    "에이3의2종상환전환우선주식 1,961주",
+    "총 38,310주",
+  ], "한빛웨이브1호");
+  assert.deepEqual(result.holdings, [{ shareClass: "상환전환우선주", shares: 2_762 }]);
+  assert.equal(result.total, 38_310);
+  assert.equal(result.confidence, "높음");
+});
+
+test("한 줄에 여러 종류가 있는 총계 셀은 동일 종류 키로 덮어쓰지 않는다", () => {
+  const result = parseRegisterLines([
+    "한빛투자조합 상환전환우선주식 2,762주 7.21%",
+    "보통주식 15,365주 / 자기주식 7,040주 / 전환상환우선주식 3,478주 /",
+    "상환전환우선주식 8,284주 / 에이3의1종상환전환우선주식 2,182주 /",
+    "합계",
+    "에이3의2종상환전환우선주식 1,961주",
+  ], "한빛투자조합");
+  assert.equal(result.total, 38_310);
+});
+
+test("압축된 종류별 총계 주변의 대상 주주 수량을 총계에 다시 더하지 않는다", () => {
+  const result = parseRegisterLines([
+    "한빛투자조합 상환전환우선주식 2,762주 7.21%",
+    "보통주식 15,365주 / 자기주식 7,040주 / 전환상환우선주식 3,478주 / 상환전환우선주식 8,284주 / 에이3의1종상환전환우선주식 2,182주 / 에이3의2종상환전환우선주식 1,961주",
+    "합계",
+  ], "한빛투자조합");
+  assert.equal(result.owned, 2_762);
+  assert.equal(result.total, 38_310);
+});
+
+test("요약명부에 대상이 없으면 보유수를 추정하지 않고 인쇄 합계를 보존한다", () => {
+  const result = parseRegisterLines([
+    "주주명 권리확정 주식수 지분율",
+    "1 대표주주 60,000 60.00%",
+    "2 기관주주 30,000 30.00%",
+    "3 기타주주 10,000 10.00%",
+    "합계 100,000 100.00%",
+  ], "한빛웨이브1호");
+  assert.equal(result.nameMatch, "실패");
+  assert.equal(result.owned, null);
+  assert.equal(result.total, 100_000);
+  assert.match(result.note, /요약 명부.*보유주식수를 확인할 수 없습니다/);
+});
+
+test("권리확정주식수 행을 더할 때 소계와 총계를 중복 합산하지 않는다", () => {
+  const result = parseRegisterLines([
+    "주주명 권리확정 주식수 지분율",
+    "1 대표주주 60,000 60.00%",
+    "2 기관주주 30,000 30.00%",
+    "소계 90,000 90.00%",
+    "3 기타주주 10,000 10.00%",
+    "합계 100,000",
+  ], "한빛웨이브1호");
+  assert.equal(result.total, 100_000);
+  assert.equal(result.owned, null);
+});
+
+test("대상이 없는 요약명부에서도 주주수 합계를 발행주식수로 오인하지 않는다", () => {
+  const result = parseRegisterLines([
+    "주주명 주주수 지분율 주식수 지분율",
+    "합계 971 100% 8,846,140 100.00%",
+  ], "한빛웨이브1호");
+  assert.equal(result.owned, null);
+  assert.equal(result.total, 8_846_140);
+});
+
+test("OCR의 숫자 뒤 흐·ㅎ 표기를 보정해 영문 세부종류 주식을 보존한다", () => {
+  for (const suffix of ["흐", "ㅎ"]) {
+    const result = parseRegisterLines([
+      `한 빛 웨 미 브 1 ${suffix} 1 코 노 미`,
+      "조 함",
+      "제 11 에 이 종 전 환 우 선 주",
+      "4,540",
+      "0.41%",
+      "다른성장투자조합",
+      "제11비종 전환우선주 3,083주 0.28%",
+      "합계 1,099,940주 100.00%",
+    ], "한빛웨이브1호");
+    assert.equal(result.nameMatch, "유사");
+    assert.deepEqual(result.holdings, [{ shareClass: "제11에이종 전환우선주", shares: 4_540 }]);
+    assert.equal(result.total, 1_099_940);
+  }
+});
+
+test("주요 이름이 같아도 다른 호수나 공통 접미사만 있는 조합을 대상 주주로 읽지 않는다", () => {
+  for (const otherName of ["한빛웨이브2호", "다른웨이브1호"]) {
+    const result = parseRegisterLines([
+      `${otherName} 전환우선주 4,540주 0.41%`,
+      "합계 1,099,940주 100.00%",
+    ], "한빛웨이브1호");
+    assert.equal(result.nameMatch, "실패");
+    assert.equal(result.owned, null);
+  }
+});

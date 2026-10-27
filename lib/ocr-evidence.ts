@@ -1,5 +1,58 @@
 import type { ParsedRegister } from "./register-parser";
 
+export function hasTargetHolding(evidence: ParsedRegister | null | undefined) {
+  return evidence !== null && evidence !== undefined
+    && evidence.nameMatch !== "실패" && evidence.owned !== null;
+}
+
+export function shouldSupplementDigitalText(options: {
+  precise: boolean;
+  hasEnoughText: boolean;
+  corruptTextLayer: boolean;
+  targetAnchorSeen: boolean;
+  parsed: ParsedRegister;
+}) {
+  const complete = hasTargetHolding(options.parsed)
+    && options.parsed.total !== null && options.parsed.holdings.length > 0;
+  if (!options.hasEnoughText) return true;
+  if (options.corruptTextLayer && !complete) return true;
+  // A summary register without the requested shareholder is not an OCR error.
+  // Only refine a readable digital layer when it actually contains the target.
+  return options.precise && options.targetAnchorSeen && !complete;
+}
+
+export function selectPrecisionRecoveryPages(pages: Array<{
+  pageNumber: number;
+  targetAnchorSeen: boolean;
+  targetNameMatched?: boolean;
+  score: number;
+}>) {
+  const matched = pages.filter((page) => page.targetNameMatched);
+  const anchored = matched.length ? matched : pages.filter((page) => page.targetAnchorSeen);
+  const first = pages.find((page) => page.pageNumber === 1);
+  const best = [...pages].sort((left, right) => right.score - left.score)[0];
+  // Read every page once before spending time on a difficult row. Target pages
+  // get one alternate layout pass. If no target is visible yet, the first page
+  // and strongest candidate retain automatic-layout recovery without retrying
+  // every page in several modes.
+  return [...new Set([
+    ...anchored.map((page) => page.pageNumber),
+    ...(!anchored.length && first ? [first.pageNumber] : []),
+    ...(!anchored.length && best ? [best.pageNumber] : []),
+  ])].slice(0, 3);
+}
+
+export function selectOrientationRecoveryPage(pages: Array<{
+  pageNumber: number;
+  targetAnchorSeen: boolean;
+  score: number;
+  text: string;
+}>) {
+  if (pages.some((page) => page.targetAnchorSeen
+    || /주주명|주식수|보통주|우선주|합계|총계/.test(page.text.replace(/\s/g, "")))) return null;
+  return [...pages].sort((left, right) => right.score - left.score)[0]?.pageNumber ?? null;
+}
+
 function evidenceScore(candidate: ParsedRegister) {
   if (candidate.nameMatch === "실패" || candidate.owned === null || !candidate.holdings.length) return Number.NEGATIVE_INFINITY;
   if (candidate.holdings.some((holding) => holding.shareClass === "주식종류 미표시" || holding.shares <= 0)) {

@@ -9,7 +9,7 @@ type RatioRow = { index: number; percent: number; candidates: number[]; share: n
 
 export const OCR_PAGE_BREAK = "__REGISTER_LENS_OCR_PAGE_BREAK__";
 
-const shareClassPattern = /(?:제\s*\d+\s*종\s*)?(?:(?:상\s*환\s*전\s*환|전\s*환\s*상\s*환|상\s*환|전\s*환)\s*)?(?:(?:우|무)\s*선|(?:우|으)\s*서)\s*주\s*(?:식)?|(?:상\s*환\s*전\s*환|전\s*환\s*상\s*환)\s*주\s*(?:식)?|보\s*통\s*주\s*(?:식)?|\bRCPS\b|\bCPS\b|\bCS\b/gi;
+const shareClassPattern = /(?:제\s*\d+\s*(?:에\s*이|비|씨|디|이|에\s*프|지|[A-Z])?\s*종\s*)?(?:(?:상\s*환\s*전\s*환|전\s*환\s*상\s*환|상\s*환|전\s*환)\s*)?(?:(?:우|무)\s*선|(?:우|으)\s*서)\s*주\s*(?:식)?|(?:상\s*환\s*전\s*환|전\s*환\s*상\s*환)\s*주\s*(?:식)?|보\s*통\s*주\s*(?:식)?|\bRCPS\b|\bCPS\b|\bCS\b/gi;
 
 export function cleanCompany(value: string) {
   return value.normalize("NFKC").toLowerCase()
@@ -25,6 +25,7 @@ export function cleanCompany(value: string) {
     .replace(/[ㅅᄉs^]?\s*(?:4|a)?\s*8\s*[86]e?(?=\s*(?:테\s*크|제\s*\d))/gi, "abb")
     .replace(/abbe(?=\s*(?:테크|제\s*\d|벤처))/gi, "abb")
     .replace(/제(\d+)흐/g, "제$1호")
+    .replace(/(\d+)\s*(?:흐|ㅎ|ᄒ)(?=\s*(?:\d|투\s*자|조\s*합|$))/g, "$1호")
     .replace(/\(\s*주\s*\)|주식회사|유한회사|합자회사|유한책임회사/g, "")
     .replace(/업무집행조합원|대표조합원/g, "").replace(/[^\p{L}\p{N}]/gu, "");
 }
@@ -36,13 +37,17 @@ function orderedCoverage(candidate: string, target: string) {
 }
 
 function editDistance(left: string, right: string) {
-  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  let previous = new Uint32Array(right.length + 1);
+  let current = new Uint32Array(right.length + 1);
+  for (let j = 0; j <= right.length; j += 1) previous[j] = j;
   for (let i = 1; i <= left.length; i += 1) {
-    const current = [i];
+    current[0] = i;
     for (let j = 1; j <= right.length; j += 1) {
       current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + (left[i - 1] === right[j - 1] ? 0 : 1));
     }
-    previous.splice(0, previous.length, ...current);
+    const swap = previous;
+    previous = current;
+    current = swap;
   }
   return previous[right.length];
 }
@@ -63,6 +68,7 @@ function bestSubstringSimilarity(candidate: string, target: string) {
 export function findTargetMatch(lines: string[], target: string): NameMatch | null {
   const compactTarget = cleanCompany(target);
   if (compactTarget.length < 2) return null;
+  const targetFundNumber = compactTarget.match(/(\d+)호/)?.[1];
   const anchors = [
     /(?:제\s*이\s*비|j\s*b)/i.test(target) ? "jb" : "",
     /기술\s*지주/.test(target) ? "기술지주" : "",
@@ -75,11 +81,14 @@ export function findTargetMatch(lines: string[], target: string): NameMatch | nu
       if (lines.slice(index, index + span).includes(OCR_PAGE_BREAK)) break;
       const text = lines.slice(index, index + span).join(" ");
       const candidate = cleanCompany(text);
+      const exact = candidate.includes(compactTarget);
+      const candidateFundNumbers = [...candidate.matchAll(/(\d+)호/g)].map((item) => item[1]);
+      if (!exact && targetFundNumber && candidateFundNumbers.length && !candidateFundNumbers.includes(targetFundNumber)) continue;
       const score = bestSubstringSimilarity(candidate, compactTarget);
       const sequenceScore = orderedCoverage(candidate, compactTarget);
-      const exact = candidate.includes(compactTarget);
       const anchorMatch = anchors.length >= 2 && anchors.every((anchor) => candidate.includes(anchor));
-      const genericMatched = genericAnchors.filter((anchor) => candidate.includes(anchor) || bestSubstringSimilarity(candidate, anchor) >= 0.78).length;
+      const genericMatched = genericAnchors.filter((anchor) => candidate.includes(anchor)
+        || (anchor === compactTarget ? score : bestSubstringSimilarity(candidate, anchor)) >= 0.78).length;
       const genericAnchorMatch = genericAnchors.length >= 2 ? genericMatched >= Math.min(2, genericAnchors.length) : genericMatched === 1 && genericAnchors[0].length >= 4;
       const abbFundMatch = compactTarget.includes("abb") && compactTarget.includes("벤처투자조합")
         && candidate.includes("abb")
@@ -89,6 +98,9 @@ export function findTargetMatch(lines: string[], target: string): NameMatch | nu
       const acceptedScore = (anchorMatch || genericAnchorMatch || abbFundMatch) ? Math.max(score, 0.88) : orderedMatch ? Math.max(score, 0.86) : score;
       if ((exact || anchorMatch || genericAnchorMatch || abbFundMatch || orderedMatch || score >= threshold) && (!best || acceptedScore > best.score || acceptedScore === best.score && span < best.span)) {
         best = { index, span, score: acceptedScore, text: lines.slice(index, index + span).join(" ").replace(/\t/g, " "), fuzzy: !exact };
+        // A score of one on a single line is already the earliest best result:
+        // no later candidate can improve its score or shorten its span.
+        if (best.score === 1 && best.span === 1) return best;
       }
     }
   }
@@ -151,8 +163,8 @@ function toPercent(value: string | undefined) {
 
 function normalizeShareClass(value: string) {
   const compact = value.replace(/\s|주식$/g, "").toUpperCase();
-  const series = compact.match(/^제(\d+)종/)?.[1] ?? null;
-  const repaired = compact.replace(/^제\d+종/, "").replace(/무선주/g, "우선주").replace(/(?:우|으)서주/g, "우선주");
+  const series = compact.match(/^제(\d+(?:에이|비|씨|디|이|에프|지|[A-Z])?)종/)?.[1] ?? null;
+  const repaired = compact.replace(/^제\d+(?:에이|비|씨|디|이|에프|지|[A-Z])?종/, "").replace(/무선주/g, "우선주").replace(/(?:우|으)서주/g, "우선주");
   let normalized: string;
   if (repaired === "CS" || repaired === "보통" || repaired.includes("보통주")) normalized = "보통주";
   else if (repaired === "RCPS") normalized = "상환전환우선주";
@@ -291,9 +303,10 @@ function sharesFollowingClass(
   const afterBeforePercent = afterClass.split(/\d+(?:\.\d+)?\s*%/, 1)[0];
   const afterNumber = quantityFromFlattenedShareRow(afterBeforePercent);
   if (afterNumber !== null) return afterNumber;
-  const beforeNumber = quantityFromFlattenedShareRow(beforeClass);
+  const beforeNumber = isAddressContinuation(beforeClass) ? null : quantityFromFlattenedShareRow(beforeClass);
   if (beforeNumber !== null) return beforeNumber;
-  for (const line of lines.slice(lineIndex + 1, maxLineExclusive)) {
+  for (let index = lineIndex + 1; index < maxLineExclusive; index += 1) {
+    const line = lines[index];
     if (/(?:합\s*계|총\s*계|총\s*발행\s*주식수|발행\s*주식(?:의)?\s*총수)/.test(line)) break;
     const explicit = line.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*주(?!의|당|금액)/);
     const value = toNumber(explicit?.[1]);
@@ -301,7 +314,18 @@ function sharesFollowingClass(
     const standalone = line.match(/^\s*(\d{1,3}(?:[,.]\d{3})+|\d+)\s*$/);
     const standaloneValue = toNumber(standalone?.[1]);
     if (standaloneValue !== null && standaloneValue > 0) return standaloneValue;
-    if (/\d+(?:\.\d+)?\s*%/.test(line)) break;
+    if (/\d+(?:\.\d+)?\s*%/.test(line)) {
+      // A vertically centred percentage can precede the bottom of the same
+      // shareholder's wrapped address and quantity cell. Only cross it when
+      // the immediately following line is clearly an address continuation.
+      const next = index + 1 < maxLineExclusive ? lines[index + 1] : "";
+      if (isAddressContinuation(next) && !new RegExp(shareClassPattern.source, "i").test(next)) {
+        const following = next.match(/(\d{1,3}(?:,\d{3})+|\d+)\s*주(?!의|당|금액)/);
+        const shares = toNumber(following?.[1]);
+        if (shares !== null && shares > 0) return shares;
+      }
+      break;
+    }
   }
   return null;
 }
@@ -316,9 +340,16 @@ function meaningfulTableText(value: string) {
     .replace(/[^\p{L}]/gu, "");
 }
 
+function isAddressContinuation(value: string) {
+  const text = value.trim();
+  return /^(?:주소\s*[:：]?\s*)?(?:서울특별시|부산광역시|대구광역시|인천광역시|광주광역시|대전광역시|울산광역시|세종특별자치시|경기도|강원(?:특별자치)?도|충청[남북]도|전라[남북]도|전북특별자치도|경상[남북]도|제주(?:특별자치)?도)/.test(text)
+    || /^\d+\s*(?:층|동|호)(?=[\s,，(（]|$)/.test(text);
+}
+
 function hasForeignNameBeforeClass(line: string, classIndex: number, target: string) {
   const prefix = line.slice(0, classIndex);
   if (cleanCompany(prefix).includes(cleanCompany(target))) return false;
+  if (isAddressContinuation(prefix)) return false;
   const meaningful = meaningfulTableText(prefix);
   const hangulLength = (meaningful.match(/[가-힣]/g) ?? []).length;
   // Mixed two-character debris such as `르 yl` is common immediately before
@@ -354,14 +385,15 @@ function isTargetContextLine(lines: string[], index: number, target: string, mat
   // A vertically merged shareholder name may put only its generic fund suffix
   // on the second line after the matched company name (for example 에티포스).
   if (matchEnd !== undefined && index <= matchEnd + 2 && /투\s*자\s*조\s*합/.test(line)) return true;
+  if (matchEnd !== undefined && index <= matchEnd + 2 && /^(?:투자)?조[합함한]$/.test(compactLine)) return true;
   const splitFundName = `${cleanCompany(matchText).slice(-1)}${compactLine}`;
-  return /(?:상생|성장|벤처|신기술)투자조합/.test(splitFundName);
+  return /^(?:상생|성장|벤처|신기술)투자조합$/.test(splitFundName);
 }
 
 function standaloneSeriesBeforeClass(lines: string[], lineIndex: number, minLineInclusive: number) {
   const previous = lines[lineIndex - 1];
   if (lineIndex <= minLineInclusive || !previous) return "";
-  const match = previous.match(/^\s*제\s*(\d+)\s*종\s*$/);
+  const match = previous.replace(/\s/g, "").match(/^제(\d+(?:에이|비|씨|디|이|에프|지|[A-Z])?)종$/i);
   return match ? `제${match[1]}종 ` : "";
 }
 
@@ -424,7 +456,7 @@ function precedingSeriesClassStart(lines: string[], match: NameMatch, target: st
     if (/(?:합\s*계|총\s*계)/.test(line)) break;
     const classes = [...line.matchAll(shareClassPattern)];
     if (classes.length) {
-      if (classes.some((item) => !/^제\s*\d+\s*종/.test(item[0]) || hasForeignNameBeforeClass(line, item.index ?? 0, target))) break;
+      if (classes.some((item) => !/^제\s*\d+\s*(?:에\s*이|비|씨|디|이|에\s*프|지|[A-Z])?\s*종/i.test(item[0]) || hasForeignNameBeforeClass(line, item.index ?? 0, target))) break;
       // The nearest series row can belong to the matched shareholder when its
       // name cell is vertically merged. A second series row farther upward is
       // the previous shareholder and must not be absorbed.
@@ -604,6 +636,7 @@ function sumConfirmedRightsColumn(lines: string[]) {
   const shares: number[] = [];
   const seenRows = new Set<string>();
   for (const line of lines) {
+    if (/(?:합\s*계|총\s*계|소\s*계)/.test(line)) continue;
     const rowKey = line.replace(/\s+/g, "").normalize("NFKC");
     if (seenRows.has(rowKey)) continue;
     seenRows.add(rowKey);
@@ -621,7 +654,7 @@ function sumConfirmedRightsColumn(lines: string[]) {
   return shares.reduce((sum, value) => sum + value, 0) / divisor;
 }
 function directTotalFromLabels(lines: string[]) {
-  const primaryLabel = /(?:총\s*발행\s*주식수|발행\s*주식(?:의)?\s*총수|발행\s*주식\s*수|총\s*주식수|주식\s*총수|주\s*주\s*총\s*수|총\s*계)/;
+  const primaryLabel = /(?:총\s*발행\s*주식수|발행\s*주식(?:의)?\s*총수|발행\s*주식\s*수|총\s*주식수|주식\s*총수|주\s*주\s*총\s*수|총\s*계|^총\s*(?=\d))/;
   const fallbackLabel = /합\s*(?:계|[Aa][Il]?|ㅅ)/;
   const candidate = (text: string, following = false) => {
     if (!text.trim() || (following && /원/.test(text))) return null;
@@ -714,6 +747,24 @@ function directTotalFromLabels(lines: string[]) {
       if (value !== null) return value;
     }
     const classTotals = new Map<string, number>();
+     const summaryLines = lines.slice(Math.max(0, index - 2), Math.min(lines.length, index + 5));
+     const multiCellStart = summaryLines.findIndex((line) => line.includes("/")
+       && [...line.matchAll(/(\d{1,3}(?:,\d{3})+|\d+)\s*주(?!의|당|금액)/g)].length >= 2);
+     if (multiCellStart >= 0) {
+       // Several classes can share a physical PDF line. Summing quantity
+       // cells preserves repeated preferred-series subtotals and treasury
+       // shares instead of overwriting them under one normalized class key.
+       const classSummaryLines: string[] = [];
+       for (const line of summaryLines.slice(multiCellStart)) {
+         if (/^\s*(?:합\s*계|총\s*계)\s*$/.test(line)) continue;
+         if (/%/.test(line) || !(new RegExp(shareClassPattern.source, "i").test(line) || /자기\s*주식/.test(line))) break;
+         classSummaryLines.push(line);
+       }
+       const summaryShares = [...new Set(classSummaryLines)]
+         .flatMap((line) => [...line.matchAll(/(\d{1,3}(?:,\d{3})+|\d+)\s*주(?!의|당|금액)/g)])
+         .map((item) => toNumber(item[1])).filter((value): value is number => value !== null && value > 0);
+       if (summaryShares.length >= 2) return summaryShares.reduce((sum, value) => sum + value, 0);
+     }
     for (let next = Math.max(0, index - 2); next < Math.min(lines.length, index + 5); next += 1) {
       const classMatch = [...lines[next].matchAll(shareClassPattern)][0];
       if (!classMatch) continue;
@@ -847,8 +898,8 @@ export function totalFromFaceValueArithmetic(lines: string[], owned: number | nu
 }
 
 function strongDocumentTotal(lines: string[]) {
-  const explicitLabel = /(?:총\s*발행\s*주식수|발행\s*주식(?:의)?\s*총수|발행\s*주식\s*수|총\s*주식수|주식\s*총수|주\s*주\s*총\s*수)/;
-  const totalLabel = /총\s*계/;
+  const explicitLabel = /(?:총\s*발행\s*주식수|발행\s*주식(?:의)?\s*총수|발행\s*주식\s*수|총\s*주식수|주식\s*총수|주\s*주\s*총\s*수|^총\s*(?=\d))/;
+  const totalLabel = /^\s*(?:총\s*합\s*계|합\s*계|총\s*계)(?=\s|[:：|]|\d|$)/;
   const valueAfter = (line: string, label: RegExp) => {
     const match = line.match(label);
     if (!match) return null;
@@ -867,6 +918,16 @@ function strongDocumentTotal(lines: string[]) {
     const explicit = valueAfter(line, explicitLabel);
     if (explicit !== null) return explicit;
     if (totalLabel.test(line) && /100(?:\.0+)?\s*%/.test(line)) {
+      const percentageCells = [...line.matchAll(/100(?:\.0+)?\s*%/g)];
+      if (percentageCells.length > 1) {
+        // Some totals contain both shareholder count/100% and shares/100%.
+        // The final numeric segment belongs to the share-total columns.
+        const previous = percentageCells.at(-2)!;
+        const final = percentageCells.at(-1)!;
+        const shareSegment = line.slice((previous.index ?? 0) + previous[0].length, final.index);
+        const shares = quantityFromFlattenedShareRow(shareSegment);
+        if (shares !== null && shares >= 100 && shares <= 1_000_000_000) return shares;
+      }
       const total = valueAfter(line, totalLabel);
       if (total !== null) return total;
     }
@@ -1181,7 +1242,10 @@ export function parseRegisterLines(linesInput: string[], target: string): Parsed
   const missing = [owned, total, ratio].filter((value) => value === null).length;
   const unknownClass = holdings.some((item) => item.shareClass === "주식종류 미표시");
   const confidence: ParsedRegister["confidence"] = !match || missing || ratioMismatch ? "확인 필요" : match.fuzzy || unknownClass ? "보통" : "높음";
-  const note = !match ? total !== null
+  const summaryOmitsTarget = !match && lines.some((line) => /기타\s*주주/.test(line));
+  const note = summaryOmitsTarget
+    ? "기타주주로 묶인 요약 명부에 대상 주주명이 표시되지 않아 보유주식수를 확인할 수 없습니다."
+    : !match ? total !== null
     ? "입력한 주주명과 유사한 이름을 찾지 못해 총발행주식수만 표시했습니다."
     : "입력한 주주명과 유사한 이름을 찾지 못했습니다."
     : missing ? `${match.fuzzy ? "유사 이름으로 주주 행을 찾았지만" : "주주 행은 찾았지만"} 일부 숫자를 찾지 못했습니다.`

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Worker as TesseractWorker } from "tesseract.js";
 import { cleanCompany, findTargetAnchorIndex, OCR_PAGE_BREAK, ocrTextScore, parseRegisterLines } from "@/lib/register-parser";
-import { buildCanonicalTargetBlock, selectCanonicalTargetEvidence } from "@/lib/ocr-evidence";
+import { buildCanonicalTargetBlock, hasTargetHolding, selectCanonicalTargetEvidence, selectOrientationRecoveryPage, selectPrecisionRecoveryPages, shouldSupplementDigitalText } from "@/lib/ocr-evidence";
 import { encodeCsv, upsertById } from "@/lib/result-utils";
 
 type JobState = "ready" | "working" | "done" | "error";
@@ -404,6 +404,37 @@ async function extractPdf(
   deadlineAt: number,
   timeoutError: AnalysisTimeoutError,
 ) {
+  const parseCache = new Map<string, ReturnType<typeof parseRegisterLines>>();
+  const anchorCache = new Map<string, number>();
+  const scoreCache = new Map<string, number>();
+  const parseCandidate = (lines: string[], candidateTarget: string) => {
+    const normalized = lines.map((line) => line.replace(/\u00a0/g, " ").replace(/[ ]+/g, " ").trim()).filter(Boolean);
+    const key = `${candidateTarget}\0${normalized.join("\n")}`;
+    let parsed = parseCache.get(key);
+    if (parsed === undefined) {
+      parsed = parseRegisterLines(normalized, candidateTarget);
+      parseCache.set(key, parsed);
+    }
+    return parsed;
+  };
+  const findCandidateAnchor = (lines: string[], candidateTarget: string) => {
+    const key = `${candidateTarget}\0${lines.join("\n")}`;
+    let anchor = anchorCache.get(key);
+    if (anchor === undefined) {
+      anchor = findTargetAnchorIndex(lines, candidateTarget);
+      anchorCache.set(key, anchor);
+    }
+    return anchor;
+  };
+  const scoreCandidateText = (text: string, candidateTarget: string) => {
+    const key = `${candidateTarget}\0${text}`;
+    let score = scoreCache.get(key);
+    if (score === undefined) {
+      score = ocrTextScore(text, candidateTarget);
+      scoreCache.set(key, score);
+    }
+    return score;
+  };
   throwIfDeadlineExceeded(signal, deadlineAt, timeoutError);
   const [pdfjs, pdfWorkerModule] = await raceWithAbort(Promise.all([
     import("pdfjs-dist"),
@@ -468,23 +499,31 @@ async function extractPdf(
   const privateUseCount = digitalText.match(/[\uE000-\uF8FF]/gu)?.length ?? 0;
   const privateUseRatio = privateUseCount / Math.max(1, compactDigitalText.length);
   const hasCorruptPrivateUseLayer = privateUseCount >= 16 && privateUseRatio >= 0.1;
-  const privateUseParseIncomplete = hasCorruptPrivateUseLayer
-    && !isCompleteOcrParse(parseRegisterLines(digitalText.split(/\r?\n/), target));
-  if (hasEnoughDigitalText && !privateUseParseIncomplete) {
+  const digitalParsed = parseCandidate(digitalText.split(/\r?\n/), target);
+  const digitalTargetPages = pageTexts.flatMap((text, index) =>
+    findCandidateAnchor(text.split(/\r?\n/).filter(Boolean), target) >= 0 ? [index + 1] : []);
+  if (!shouldSupplementDigitalText({
+    precise: analysisPass === "precise",
+    hasEnoughText: hasEnoughDigitalText,
+    corruptTextLayer: hasCorruptPrivateUseLayer,
+    targetAnchorSeen: digitalTargetPages.length > 0,
+    parsed: digitalParsed,
+  })) {
     return { text: digitalText, method: "PDF 텍스트" as const };
   }
 
   const worker = await getOcrWorker((progress) => onProgress(40 + Math.round(progress * 55), "한글 OCR 분석 중"), signal);
   const ocrText: string[] = [];
-  let canonicalTargetEvidence: ReturnType<typeof parseRegisterLines> | null = null;
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+  let canonicalTargetEvidence = hasEnoughDigitalText ? selectCanonicalTargetEvidence([digitalParsed]) : null;
+  const allPageNumbers = Array.from({ length: pdf.numPages }, (_, index) => index + 1);
+  const ocrPageNumbers = hasEnoughDigitalText && !hasCorruptPrivateUseLayer && digitalTargetPages.length
+    ? [...new Set([...digitalTargetPages, ...(digitalParsed.total === null ? [pdf.numPages] : [])])]
+    : allPageNumbers;
+  const multiPagePrecision = analysisPass === "precise" && pdf.numPages > 3;
+  const renderOcrPage = async (pageNumber: number, scale: number) => {
     throwIfDeadlineExceeded(signal, deadlineAt, timeoutError);
     const page = await raceWithAbort(pdf.getPage(pageNumber), signal);
-    // Browser OCR cost grows roughly with the pixel area. Multi-page scans use
-    // a verified 144-DPI equivalent; one-page precision keeps extra detail for
-    // dense total rows such as 클립스비엔씨.
-    const viewportScale = analysisPass === "precise" ? (pdf.numPages > 2 ? 2 : 3) : 2.2;
-    const viewport = page.getViewport({ scale: viewportScale });
+    const viewport = page.getViewport({ scale });
     const canvas = makeCanvas();
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
@@ -498,9 +537,54 @@ async function extractPdf(
     } finally {
       signal.removeEventListener("abort", cancelRender);
     }
-    const candidates: Array<{ text: string; score: number; degrees?: number; mode?: string }> = [];
+    return { canvas, context };
+  };
+  const sparsePages = new Map<number, { canvas: HTMLCanvasElement; context: CanvasRenderingContext2D; text: string }>();
+  const orientationCandidates = new Map<number, Array<{ text: string; score: number; degrees: number; mode: string }>>();
+  let recoveryPages = new Set<number>();
+  if (multiPagePrecision) {
+    const pageEvidence: Array<{ pageNumber: number; targetAnchorSeen: boolean; targetNameMatched: boolean; score: number; text: string }> = [];
+    for (const pageNumber of ocrPageNumbers) {
+      const rendered = await renderOcrPage(pageNumber, 2);
+      await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "11" }), signal);
+      const reading = await raceWithAbort(worker.recognize(rendered.canvas), signal);
+      const text = reading.data.text;
+      const parsed = parseCandidate(text.split(/\r?\n/), target);
+      sparsePages.set(pageNumber, { ...rendered, text });
+      pageEvidence.push({
+        pageNumber,
+        targetAnchorSeen: findCandidateAnchor(text.split(/\r?\n/).filter(Boolean), target) >= 0,
+        targetNameMatched: parsed.nameMatch !== "실패",
+        score: scoreCandidateText(text, target),
+        text,
+      });
+      onProgress(40 + Math.round((sparsePages.size / ocrPageNumbers.length) * 30), `전체 페이지 빠른 OCR · ${sparsePages.size}/${ocrPageNumbers.length}쪽`);
+    }
+    recoveryPages = new Set(selectPrecisionRecoveryPages(pageEvidence));
+    const orientationPage = selectOrientationRecoveryPage(pageEvidence);
+    const orientationSource = orientationPage === null ? null : sparsePages.get(orientationPage);
+    if (orientationPage !== null && orientationSource) {
+      const readings: Array<{ text: string; score: number; degrees: number; mode: string }> = [];
+      for (const degrees of [90, 270]) {
+        if (deadlineAt - Date.now() <= 15_000) break;
+        const reading = await raceWithAbort(worker.recognize(orientationSource.canvas, { rotateRadians: degrees * Math.PI / 180 }), signal);
+        readings.push({ text: reading.data.text, score: scoreCandidateText(reading.data.text, target), degrees, mode: "raw-11" });
+        if (hasTargetHolding(parseCandidate(reading.data.text.split(/\r?\n/), target))) break;
+      }
+      orientationCandidates.set(orientationPage, readings);
+    }
+  }
+  for (const pageNumber of ocrPageNumbers) {
+    throwIfDeadlineExceeded(signal, deadlineAt, timeoutError);
+    const page = await raceWithAbort(pdf.getPage(pageNumber), signal);
+    const cachedPage = sparsePages.get(pageNumber);
+    let { canvas, context } = cachedPage ?? await renderOcrPage(pageNumber,
+      analysisPass === "precise" ? (pdf.numPages > 2 ? 2 : 3) : 2.2);
+    const candidates: Array<{ text: string; score: number; degrees?: number; mode?: string }> = cachedPage
+      ? [{ text: cachedPage.text, score: scoreCandidateText(cachedPage.text, target), mode: "raw-11" }, ...(orientationCandidates.get(pageNumber) ?? [])]
+      : [];
     let rawDocumentComplete = false;
-    let rawPageSufficient = false;
+    let rawPageSufficient = multiPagePrecision;
 
     // 정밀 분석은 표 선을 지우기 전의 원본을 먼저 읽는다. 선 제거는 숫자
     // 칸에는 유리하지만 여러 줄 회사명과 합계 라벨을 훼손할 수 있다.
@@ -508,32 +592,31 @@ async function extractPdf(
       // Sparse text is the most reliable first pass for ruled shareholder
       // tables. Automatic layout remains the fallback for documents whose
       // totals are preserved better as full rows.
-      // Three-or-more-page scans must stay within the 90-second document
-      // budget. PSM 3 preserves the target row on the first page; after target
-      // evidence is secured, sparse PSM 11 preserves separated subtotal/total
-      // cells on later pages without adding another full-page pass. Every page
-      // of a two-page table still gets both modes because the second page can
-      // contain another class belonging to the same shareholder.
-      const rawModes = pdf.numPages > 2
-        ? (pageNumber > 1 && canonicalTargetEvidence?.owned !== null ? ["11"] : ["3"])
+      // Longer scans already have one sparse reading of every page. Give only
+      // target-bearing pages one alternate layout pass and reserve ten seconds
+      // for candidate selection and totals, instead of exhausting the deadline
+      // on repeated rotations. Two-page tables keep their established modes.
+      const rawModes = multiPagePrecision
+        ? (recoveryPages.has(pageNumber) && deadlineAt - Date.now() > 10_000 ? ["3"] : [])
+        : pdf.numPages > 2 ? (pageNumber > 1 && hasTargetHolding(canonicalTargetEvidence) ? ["11"] : ["3"])
         : pdf.numPages === 1 ? ["3", "11", "6"] : ["3", "11"];
       for (const mode of rawModes) {
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: mode }), signal);
         const rawReading = await raceWithAbort(worker.recognize(canvas), signal);
-        candidates.push({ text: rawReading.data.text, score: ocrTextScore(rawReading.data.text, target), mode: `raw-${mode}` });
+        candidates.push({ text: rawReading.data.text, score: scoreCandidateText(rawReading.data.text, target), mode: `raw-${mode}` });
         if (typeof document !== "undefined" && new URLSearchParams(document.location.search).has("debug")) {
           const payload = { pageNumber, mode: `raw-${mode}`, text: rawReading.data.text };
           document.documentElement.setAttribute("data-last-ocr", encodeURIComponent(JSON.stringify(payload)));
         }
         const rawDocumentText = [...ocrText, ...candidates.map((candidate) => candidate.text)].join("\n");
-        const rawParsed = parseRegisterLines(rawDocumentText.split(/\r?\n/), target);
+        const rawParsed = parseCandidate(rawDocumentText.split(/\r?\n/), target);
         const targetReliable = rawParsed.nameMatch !== "실패" && rawParsed.owned !== null;
         const totalReliable = rawParsed.total !== null && hasExplicitTotalAnchor(rawDocumentText);
         rawDocumentComplete = isCompleteOcrParse(rawParsed) && totalReliable
           && rawParsed.confidence !== "확인 필요";
         // A total without the target holding is not sufficient when the target
         // anchor is present on this page (블루닷). Continue into processed OCR.
-        rawPageSufficient = pageNumber < pdf.numPages && targetReliable;
+        rawPageSufficient = multiPagePrecision || pageNumber < pdf.numPages && targetReliable;
         // On the first page of a multi-page scan, PSM 3 can find the target row
         // while dropping a narrow share-class cell or the exact issued-share
         // quantity. Always give sparse PSM 11 one chance before accepting that
@@ -548,19 +631,38 @@ async function extractPdf(
         if (rawPageSufficient && mode === "11" || highConfidenceComplete && mayStopAfterThisRawMode) break;
       }
       const rawTargetAnchorSeen = candidates.some((candidate) =>
-        findTargetAnchorIndex(candidate.text.split(/\r?\n/).filter(Boolean), target) >= 0);
+        findCandidateAnchor(candidate.text.split(/\r?\n/).filter(Boolean), target) >= 0);
       // Once a three-or-more-page register has already produced trustworthy
       // target evidence, later non-target pages are needed only for subtotals
       // and the grand total. One layout-preserving raw pass is sufficient;
       // running processed/rotated fallbacks on the final page exceeds the
       // 90-second document budget without improving the target holding.
       const laterTotalsOnlyPage = pdf.numPages > 2 && pageNumber > 1
-        && canonicalTargetEvidence?.owned !== null && !rawTargetAnchorSeen;
+        && hasTargetHolding(canonicalTargetEvidence) && !rawTargetAnchorSeen;
       if (!rawTargetAnchorSeen && (pageNumber < pdf.numPages || laterTotalsOnlyPage)) rawPageSufficient = true;
       await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "6" }), signal);
     }
 
+    if (multiPagePrecision && recoveryPages.has(pageNumber)) {
+      // Sparse/automatic OCR can keep the name and quantity while losing a
+      // narrow stock-class cell. Give only that target page one ruled-table
+      // reading, rather than accepting an incomplete sparse result.
+      rawPageSufficient = candidates.some((candidate) => {
+        const parsed = parseCandidate(candidate.text.split(/\r?\n/), target);
+        return hasTargetHolding(parsed) && parsed.holdings.length > 0
+          && parsed.holdings.every((holding) => holding.shareClass !== "주식종류 미표시");
+      });
+    }
     if (!rawDocumentComplete && !rawPageSufficient) {
+      if (multiPagePrecision) {
+        // Keep the full-document sweep small, but restore the established
+        // basic-pass resolution before rule removal on a difficult target row.
+        // At 144 DPI narrow 4/6 glyphs can merge with the erased table rules.
+        const detailed = await renderOcrPage(pageNumber, 2.2);
+        releaseCanvas(canvas);
+        canvas = detailed.canvas;
+        context = detailed.context;
+      }
       // Long table rules cause Tesseract to discard entire cells. Remove only
       // continuous horizontal/vertical strokes, preserving the shorter glyphs.
       const pixels = context.getImageData(0, 0, canvas.width, canvas.height);
@@ -605,9 +707,9 @@ async function extractPdf(
       context.putImageData(pixels, 0, 0);
       await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "6" }), signal);
       const first = await raceWithAbort(worker.recognize(canvas), signal);
-      candidates.push({ text: first.data.text, score: ocrTextScore(first.data.text, target) });
+      candidates.push({ text: first.data.text, score: scoreCandidateText(first.data.text, target) });
       const fastDocumentText = [...ocrText, ...candidates.map((candidate) => candidate.text)].join("\n");
-      const fastParsed = parseRegisterLines(fastDocumentText.split(/\r?\n/), target);
+      const fastParsed = parseCandidate(fastDocumentText.split(/\r?\n/), target);
       const fastTarget = cleanCompany(target);
       const fastAnchoredFundRow = fastTarget.includes("abb")
         && /(?:ABB(?:E)?|(?:4|A)?\s*8\s*[86])[^\n]{0,120}?벤처투자조합[^\n]{0,120}?\d{3,}\s+(?:\d{1,2}\.\d+|\d{3})\s*%/i.test(fastDocumentText);
@@ -617,13 +719,13 @@ async function extractPdf(
         && (fastParsed.total !== null || pageNumber < pdf.numPages);
       // 기본 분석은 PSM 6 한 번만 사용해 빠르게 끝낸다. 정밀 재분석에서만
       // 희소/자동 레이아웃 OCR과 회전·원본 보강 단계를 수행한다.
-      if (!fastComplete && analysisPass === "precise") {
+      if (!fastComplete && analysisPass === "precise" && !multiPagePrecision) {
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "11" }), signal);
         const sparse = await raceWithAbort(worker.recognize(canvas), signal);
-        candidates.push({ text: sparse.data.text, score: ocrTextScore(sparse.data.text, target) });
+        candidates.push({ text: sparse.data.text, score: scoreCandidateText(sparse.data.text, target) });
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "3" }), signal);
         const automatic = await raceWithAbort(worker.recognize(canvas), signal);
-        candidates.push({ text: automatic.data.text, score: ocrTextScore(automatic.data.text, target) });
+        candidates.push({ text: automatic.data.text, score: scoreCandidateText(automatic.data.text, target) });
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "6" }), signal);
       }
     }
@@ -633,15 +735,15 @@ async function extractPdf(
       [...ocrText, ...candidates.map((candidate) => candidate.text)].join("\n"),
     ];
     const baseComplete = baseTexts.some((text) => {
-      const parsed = parseRegisterLines(text.split(/\r?\n/), target);
+      const parsed = parseCandidate(text.split(/\r?\n/), target);
       return isCompleteOcrParse(parsed) && parsed.confidence !== "확인 필요";
     });
-    const targetAnchorSeen = candidates.some((candidate) => findTargetAnchorIndex(candidate.text.split(/\r?\n/).filter(Boolean), target) >= 0);
+    const targetAnchorSeen = candidates.some((candidate) => findCandidateAnchor(candidate.text.split(/\r?\n/).filter(Boolean), target) >= 0);
     // On a multi-page register, do not spend four rotated/raw OCR passes on an
     // earlier page that plainly does not contain the requested shareholder.
     // Keep its normal/sparse text for totals and reserve exhaustive OCR for the
     // page where the target anchor appears (or the final page as a safeguard).
-    const exhaustiveNeeded = analysisPass === "precise" && !rawPageSufficient
+    const exhaustiveNeeded = analysisPass === "precise" && !multiPagePrecision && !rawPageSufficient
       && (targetAnchorSeen || pageNumber === pdf.numPages);
     if (!baseComplete && exhaustiveNeeded) {
       for (const degrees of [90, 270]) {
@@ -654,10 +756,10 @@ async function extractPdf(
         rotatedContext.rotate(degrees * Math.PI / 180);
         rotatedContext.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
         const rotatedResult = await raceWithAbort(worker.recognize(rotated), signal);
-        candidates.push({ text: rotatedResult.data.text, score: ocrTextScore(rotatedResult.data.text, target), degrees });
+        candidates.push({ text: rotatedResult.data.text, score: scoreCandidateText(rotatedResult.data.text, target), degrees });
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "11" }), signal);
         const rotatedSparse = await raceWithAbort(worker.recognize(rotated), signal);
-        candidates.push({ text: rotatedSparse.data.text, score: ocrTextScore(rotatedSparse.data.text, target), degrees });
+        candidates.push({ text: rotatedSparse.data.text, score: scoreCandidateText(rotatedSparse.data.text, target), degrees });
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: "6" }), signal);
         releaseCanvas(rotated);
       }
@@ -666,7 +768,7 @@ async function extractPdf(
     // name or a narrow stock-class cell. Retain one raw sparse reading when the
     // holding was found but every candidate lost its class; run the full raw
     // fallback only when the holding itself is still missing.
-    const candidateParses = candidates.map((candidate) => parseRegisterLines(candidate.text.split(/\r?\n/), target));
+    const candidateParses = candidates.map((candidate) => parseCandidate(candidate.text.split(/\r?\n/), target));
     const hasOwnedCandidate = candidateParses.some((parsed) => parsed.owned !== null);
     const hasClassedOwnedCandidate = candidateParses.some((parsed) => parsed.owned !== null
       && parsed.holdings.some((holding) => holding.shareClass !== "주식종류 미표시"));
@@ -697,10 +799,10 @@ async function extractPdf(
       for (const mode of classOnlyRecovery ? ["11"] : ["6", "11", "4", "3"]) {
         await raceWithAbort(worker.setParameters({ tessedit_pageseg_mode: mode }), signal);
         const reading = await raceWithAbort(worker.recognize(oriented), signal);
-        candidates.push({ text: reading.data.text, score: ocrTextScore(reading.data.text, target), degrees: direction });
+        candidates.push({ text: reading.data.text, score: scoreCandidateText(reading.data.text, target), degrees: direction });
         if (classOnlyRecovery && mode === "11") {
           const rawLines = reading.data.text.split(/\r?\n/).filter(Boolean);
-          const anchor = findTargetAnchorIndex(rawLines, target);
+          const anchor = findCandidateAnchor(rawLines, target);
           const targetBlock = anchor >= 0 ? rawLines.slice(anchor, anchor + 6).join("\n") : "";
           const classes = new Set([...targetBlock.matchAll(shareClassPattern)].map((item) => normalizeShareClass(item[0])));
           if (classes.size === 1) rawClassEvidence = [...classes][0];
@@ -710,7 +812,7 @@ async function extractPdf(
       releaseCanvas(raw);
       releaseCanvas(oriented);
     }
-    const selectionCandidateParses = candidates.map((candidate) => parseRegisterLines(candidate.text.split(/\r?\n/), target));
+    const selectionCandidateParses = candidates.map((candidate) => parseCandidate(candidate.text.split(/\r?\n/), target));
     canonicalTargetEvidence = selectCanonicalTargetEvidence([
       canonicalTargetEvidence,
       selectCanonicalTargetEvidence(selectionCandidateParses),
@@ -738,7 +840,7 @@ async function extractPdf(
     const complementaryClassEvidence = distinctCandidateClasses.size >= 2
       && distinctCandidateClasses.size > maximumSingleClassCount;
     const hasUsableCompleteSingle = !complementaryClassEvidence && options.some((candidate) => {
-      const parsed = parseRegisterLines(candidate.text.split(/\r?\n/), target);
+      const parsed = parseCandidate(candidate.text.split(/\r?\n/), target);
       return isCompleteOcrParse(parsed) && parsed.confidence !== "확인 필요";
     });
     // Combining two complete readings duplicates shareholder rows and can make
@@ -748,13 +850,13 @@ async function extractPdf(
       for (let right = left + 1; right < candidates.length; right += 1) {
         if ((candidates[left].degrees ?? 0) !== (candidates[right].degrees ?? 0)) continue;
         const combinedText = `${options[left].text}\n${options[right].text}`;
-        const combinedParsed = parseRegisterLines(combinedText.split(/\r?\n/), target);
+        const combinedParsed = parseCandidate(combinedText.split(/\r?\n/), target);
         if (combinedParsed.confidence === "확인 필요") continue;
         options.push({ text: combinedText, score: (candidates[left].score + candidates[right].score) / 2, mode: "combined" });
       }
     }
     const bestCandidate = options.map((candidate) => {
-      const extracted = parseRegisterLines(candidate.text.split(/\r?\n/), target);
+      const extracted = parseCandidate(candidate.text.split(/\r?\n/), target);
       // Prefer a single OCR result or complementary pair that yields both holdings and total shares.
       const hasTarget = extracted.nameMatch !== "실패";
       const exactName = extracted.nameMatch === "정확";
@@ -774,14 +876,14 @@ async function extractPdf(
         + preferredRawModeBonus;
       return { ...candidate, quality: candidate.score + extractionScore };
     }).sort((left, right) => right.quality - left.quality || right.score - left.score)[0];
-    const bestCandidateParsed = parseRegisterLines(bestCandidate.text.split(/\r?\n/), target);
+    const bestCandidateParsed = parseCandidate(bestCandidate.text.split(/\r?\n/), target);
     const fusedClassHoldingLine = rawClassEvidence && bestCandidateParsed.owned !== null
       && bestCandidateParsed.holdings.every((holding) => holding.shareClass === "주식종류 미표시")
       ? `${target} ${rawClassEvidence} ${bestCandidateParsed.owned}주`
       : "";
     const totalLabel = /(?:합\s*(?:계|[Aa][Il]?|ㅅ)|총\s*계|총\s*발행\s*주식수|주식\s*총수)/;
     const supplementalTotalLines = hasUsableCompleteSingle ? [] : [...new Set(candidates.flatMap((candidate) => {
-      const candidateParsed = parseRegisterLines(candidate.text.split(/\r?\n/), target);
+      const candidateParsed = parseCandidate(candidate.text.split(/\r?\n/), target);
       // A target row that contradicts its own printed percentage is not safe
       // evidence for class-subtotal inference. Explicit 합계/100% rows remain
       // eligible because they are independent of that damaged target row.
@@ -823,13 +925,13 @@ async function extractPdf(
     // the candidate block that contains the largest number of distinct classes.
     // This is especially important when the name itself is split over 2-3 lines.
     const hasMultiClassSingle = candidates.some((candidate) => {
-      const parsed = parseRegisterLines(candidate.text.split(/\r?\n/), target);
+      const parsed = parseCandidate(candidate.text.split(/\r?\n/), target);
       return parsed.holdings.length >= 2;
     });
     const supplementalTargetBlock = !hasMultiClassSingle
       || bestCandidateParsed.holdings.length >= maximumSingleClassCount ? "" : candidates.map((candidate) => {
       const lines = candidate.text.split(/\r?\n/).filter(Boolean);
-      const start = findTargetAnchorIndex(lines, target);
+      const start = findCandidateAnchor(lines, target);
       if (start < 0) return null;
       const block = lines.slice(Math.max(0, start - 2), start + 8).join("\n");
       const classNames = [...block.matchAll(/(?:상\s*환\s*)?(?:전\s*환\s*)?(?:우|무)\s*선\s*주\s*(?:식)?|보\s*통\s*주\s*(?:식)?/g)]
@@ -885,7 +987,7 @@ async function extractPdf(
         }
       }
     }
-    const candidateTotals = candidates.map((candidate) => parseRegisterLines([target, ...candidate.text.split(/\r?\n/)], target).total)
+    const candidateTotals = candidates.map((candidate) => parseCandidate([target, ...candidate.text.split(/\r?\n/)], target).total)
       .filter((value): value is number => value !== null);
     const ratioMatchedTotal = fusedShares && fusedRatio ? candidateTotals
       .map((total) => ({ total, error: Math.abs(fusedShares! / total * 100 - fusedRatio!) }))
@@ -901,11 +1003,11 @@ async function extractPdf(
       const debugGlobal = globalThis as typeof globalThis & { __registerLensDebug?: unknown[] };
       const summarize = (text: string) => {
         const lines = text.split(/\r?\n/).filter(Boolean);
-        const anchor = findTargetAnchorIndex(lines, target);
+        const anchor = findCandidateAnchor(lines, target);
         const quantityAnchor = lines.findIndex((line) => /144\s*[,．.]\s*970|3\s*[.,]\s*128/.test(line));
         const snippetAnchor = anchor >= 0 ? anchor : quantityAnchor;
         return {
-          parsed: parseRegisterLines(lines, target),
+          parsed: parseCandidate(lines, target),
           anchor,
           lines: snippetAnchor >= 0 ? lines.slice(Math.max(0, snippetAnchor - 4), snippetAnchor + 8) : [],
         };
@@ -939,7 +1041,7 @@ async function extractPdf(
     onProgress(40 + Math.round((pageNumber / pdf.numPages) * 55), `OCR 분석 중 · ${pageNumber}/${pdf.numPages}쪽`);
     releaseCanvas(canvas);
     const completedDocumentText = ocrText.join("\n");
-    const completedDocument = parseRegisterLines(completedDocumentText.split(/\r?\n/), target);
+    const completedDocument = parseCandidate(completedDocumentText.split(/\r?\n/), target);
     // Short registers keep the established fast path. For three pages or more,
     // an early shareholder row is not enough: later pages often carry the
     // subtotals or grand total needed to repair an OCR-damaged issued-share
@@ -948,7 +1050,7 @@ async function extractPdf(
       && isCompleteOcrParse(completedDocument) && hasExplicitTotalAnchor(completedDocumentText)) break;
   }
     throwIfDeadlineExceeded(signal, deadlineAt, timeoutError);
-    const documentText = ocrText.join("\n");
+    const documentText = [...ocrText, ...(hasEnoughDigitalText ? [OCR_PAGE_BREAK, digitalText] : [])].join("\n");
     const canonicalTargetBlock = buildCanonicalTargetBlock(target, canonicalTargetEvidence);
     // Keep the strongest target-row evidence isolated from later OCR pages and
     // alternate segmentation modes. The remainder of the document is still
@@ -958,6 +1060,9 @@ async function extractPdf(
       : documentText;
     return { text: stabilizedText, method: "OCR" as const };
   } finally {
+    parseCache.clear();
+    anchorCache.clear();
+    scoreCache.clear();
     for (const canvas of trackedCanvases) releaseCanvas(canvas);
     try { await pdf.destroy(); } catch { /* A cancelled PDF worker may already be destroyed. */ }
   }
@@ -1039,6 +1144,8 @@ export default function Home() {
             workerPath: "/_next/static/ocr/worker.min.js",
             corePath: "/_next/static/ocr/core",
             langPath: "/_next/static/ocr/lang",
+            // vinext serves .gz as a transport variant of the uncompressed
+            // asset, rather than as an addressable standalone URL.
             gzip: false,
             logger: (event) => {
               if (workerGenerationRef.current === generation && !signal.aborted) loggerRef.current(event.progress || 0);
@@ -1233,7 +1340,7 @@ export default function Home() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label="주주명부 렌즈 홈">
           <span className="brand-mark" aria-hidden="true">株</span>
-          <span>주주명부 렌즈 <small>v2026.09.18.6</small></span>
+          <span>주주명부 렌즈 <small>v2026.10.27.6</small></span>
         </a>
         <div className="privacy-pill"><span aria-hidden="true">●</span> 문서는 브라우저 안에서만 처리됩니다</div>
       </header>
@@ -1320,7 +1427,7 @@ export default function Home() {
         <div className="review-note"><span aria-hidden="true">i</span><p><b>최종 확인을 권장합니다.</b> OCR은 문서 품질과 표 구조에 따라 숫자를 잘못 읽을 수 있습니다. “확인 필요” 항목은 반드시 원본 주주명부와 대조하세요.</p></div>
       </section>
 
-        <footer><span>주주명부 렌즈 <small>v2026.09.18.6</small></span><p>PDF는 업로드되거나 저장되지 않습니다.</p></footer>
+        <footer><span>주주명부 렌즈 <small>v2026.10.27.6</small></span><p>PDF는 업로드되거나 저장되지 않습니다.</p></footer>
     </main>
   );
 }

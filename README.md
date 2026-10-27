@@ -13,6 +13,8 @@
 
 PDF와 OCR 데이터는 외부 서버로 전송하지 않고 사용자의 브라우저 안에서 처리합니다.
 
+OCR 언어파일과 실행 코어는 `public/_next/static/ocr/`에 포함됩니다. 서버가 제공하는 `.traineddata` 원본과 압축 전송용 `.traineddata.gz` 파일을 함께 유지해야 합니다.
+
 ## 요구사항
 
 - Windows 10/11

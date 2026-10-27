@@ -44,9 +44,8 @@ yarn-error.log*
 /tmp/
 /releases/
 
-# redundant uncompressed OCR language files
+# local OCR caches (the public uncompressed files are required by vinext)
 /*.traineddata
-/public/_next/static/ocr/lang/*.traineddata
 /public/ocr/
 
 # locally analyzed user documents
