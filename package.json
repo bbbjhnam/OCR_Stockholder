@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "vinext dev",
     "build": "vinext build",
+    "build:portable": "node scripts/build-portable.mjs",
+    "test:portable": "node scripts/test-portable.mjs",
     "start": "vinext start",
     "test": "node --test tests/register-parser.test.ts tests/result-utils.test.ts tests/ocr-evidence.test.ts && vinext build",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
